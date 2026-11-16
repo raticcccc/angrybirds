@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Poster Skies — WebAR</title>
+<script src="./lib/aframe.min.js"></script>
+<script src="./lib/mindar-image-aframe.prod.js"></script>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,sans-serif}
+  #hud{position:fixed;top:10px;left:10px;right:10px;display:flex;justify-content:space-between;z-index:10;pointer-events:none;color:#fff;text-shadow:0 1px 4px #000}
+  #score{font-weight:800;font-size:22px}
+  #credit{font-size:12px;opacity:.85;text-align:right}
+  #hint{position:fixed;bottom:18px;left:0;right:0;text-align:center;color:#fff;text-shadow:0 1px 4px #000;z-index:10;pointer-events:none;font-size:14px}
+  #info{position:fixed;left:12px;right:12px;bottom:60px;background:rgba(20,24,40,.88);color:#fff;border-radius:12px;padding:12px 14px;z-index:11;display:none;font-size:14px}
+  #start{position:fixed;inset:0;background:#10182c;color:#fff;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px}
+  #start button{margin-top:18px;font-size:18px;padding:12px 28px;border:0;border-radius:999px;background:#ffcf33;font-weight:700}
+</style>
+</head>
+<body>
+<div id="start">
+  <h1 style="margin:0 0 8px">Poster Skies</h1>
+  <p style="max-width:320px;opacity:.85">Point your camera at the poster. A flock of critters will take off from it &mdash; tap one to send it flying.</p>
+  <button id="go">Start</button>
+</div>
+<div id="hud"><div id="score">Launched: 0</div><div id="credit">Ratik Reddy &middot; SC24UCOM025</div></div>
+<div id="info"></div>
+<div id="hint">Looking for the poster&hellip;</div>
+
+<a-scene mindar-image="imageTargetSrc: ./assets/poster.mind; autoStart: false; uiScanning: no; uiLoading: no; filterMinCF:0.0001; filterBeta:0.001"
+         color-space="sRGB" renderer="colorManagement: true; physicallyCorrectLights: true"
+         embedded vr-mode-ui="enabled: false" device-orientation-permission-ui="enabled: false"
+         game-logic>
+  <a-camera position="0 0 0" look-controls="enabled: false" cursor="fuse: false; rayOrigin: mouse" raycaster="far: 10000; objects: .tap"></a-camera>
+  <a-entity mindar-image-target="targetIndex: 0" id="target"></a-entity>
+  <!-- stage lives outside the target so it stays put after the poster is lost -->
+  <a-entity id="stage" visible="false">
+    <a-light type="ambient" intensity="1.1"></a-light>
+    <a-light type="directional" intensity="1.4" position="0.5 1 1"></a-light>
+    <a-entity id="flock"></a-entity>
+    <a-entity id="nodes"></a-entity>
+  </a-entity>
+</a-scene>
+
+<script>
+/* ---------- config: edit this list to change the flock ---------- */
+const CRITTERS = [
+  {kind:'puff',  color:'#2ec4b6', belly:'#c9f5ef', accent:'#ff9f1c', scale:0.95},
+  {kind:'dart',  color:'#ff7f50', belly:'#ffe3d3', accent:'#3d405b', scale:1.0},
+  {kind:'tower', color:'#9b5de5', belly:'#e6d4fa', accent:'#f9c74f', scale:0.9},
+  {kind:'brick', color:'#8ac926', belly:'#e9f7c8', accent:'#e63946', scale:1.0},
+  {kind:'owl',   color:'#f15bb5', belly:'#ffd9ee', accent:'#00bbf9', scale:0.9},
+  {kind:'long',  color:'#4cc9f0', belly:'#dff6fd', accent:'#f72585', scale:1.0},
+];
+/* Info nodes: x,y in poster units (poster width = 1, height = 0.625), centered at 0,0 */
+const NODES = [
+  {x:-0.33, y: 0.15, text:'Info node 1: edit me in the NODES list in index.html'},
+  {x: 0.0,  y:-0.1,  text:'Info node 2: tap a critter to launch it!'},
+  {x: 0.33, y: 0.18, text:'Info node 3: score counts every launch.'},
+];
+/* ---------- procedural sounds (no audio files needed) ---------- */
+let actx;
+function blip(f0,f1,dur,type='square',vol=.12){
+  if(!actx) return;
+  const o=actx.createOscillator(), g=actx.createGain();
+  o.type=type; o.frequency.setValueAtTime(f0,actx.currentTime);
+  o.frequency.exponentialRampToValueAtTime(f1,actx.currentTime+dur);
+  g.gain.setValueAtTime(vol,actx.currentTime); g.gain.exponentialRampToValueAtTime(.001,actx.currentTime+dur);
+  o.connect(g).connect(actx.destination); o.start(); o.stop(actx.currentTime+dur);
+}
+const sfx={ launch:()=>{blip(300,1200,.35,'sawtooth');setTimeout(()=>blip(900,500,.15,'triangle'),200)},
+            node:()=>blip(600,900,.12,'sine',.15) };
+
+/* ---------- critter: original round creature built from primitives ---------- */
+AFRAME.registerComponent('critter',{
+  schema:{kind:{default:'puff'},color:{default:'#fff'},belly:{default:'#fff'},accent:{default:'#f90'}},
+  init(){
+    const el=this.el, d=this.data;
+    const mk=(tag,attrs,parent=el)=>{const e=document.createElement(tag);for(const k in attrs)e.setAttribute(k,attrs[k]);parent.appendChild(e);return e;};
+    const body=(r,sc,col=d.color,pos='0 0 0')=>mk('a-sphere',{radius:r,color:col,scale:sc,position:pos,'segments-width':18,'segments-height':14,class:'tap'});
+    const eye=(x,y,z,r=.022,pupil=.011)=>{ mk('a-sphere',{radius:r,color:'#fff',position:`${x} ${y} ${z}`,scale:'1 1.1 .7'}); mk('a-sphere',{radius:pupil,color:'#111',position:`${x} ${y} ${z+r*.7}`}); };
+    const beak=(len,rad,col,pos,rot='90 0 0')=>mk('a-cone',{'radius-bottom':rad,'radius-top':0,height:len,color:col,position:pos,rotation:rot});
+    const wing=(x,r,sc)=>mk('a-sphere',{radius:r,color:d.color,position:`${x} 0 -.005`,scale:sc});
+    let wl, wr;
+    switch(d.kind){
+      case 'puff': // round, big cheeks, tiny beak, 3-tuft crest
+        body(.05,'1 1 1'); body(.034,'1.1 .8 .8',d.belly,'0 -.02 .028');
+        eye(-.02,.015,.042); eye(.02,.015,.042);
+        mk('a-sphere',{radius:.012,color:'#ff8fa3',position:'-.036 -.006 .036'}); mk('a-sphere',{radius:.012,color:'#ff8fa3',position:'.036 -.006 .036'});
+        beak(.025,.011,d.accent,'0 -.012 .054');
+        for(let i=-1;i<=1;i++) mk('a-cone',{'radius-bottom':.01,'radius-top':0,height:.05,color:d.accent,position:`${i*.02} .056 0`,rotation:`0 0 ${-i*22}`});
+        wl=wing(-.05,.025,'.4 1 1'); wr=wing(.05,.025,'.4 1 1'); break;
+      case 'dart': // teardrop, long pointed beak, swept tail
+        body(.042,'1 .9 1.5'); body(.028,'1 .6 1.2',d.belly,'0 -.02 .01');
+        eye(-.022,.014,.04,.018,.009); eye(.022,.014,.04,.018,.009);
+        beak(.06,.012,d.accent,'0 -.002 .088');
+        mk('a-cone',{'radius-bottom':.02,'radius-top':0,height:.08,color:d.accent,position:'0 .004 -.1',rotation:'-90 0 0'});
+        mk('a-cone',{'radius-bottom':.008,'radius-top':0,height:.04,color:d.accent,position:'0 .045 .03',rotation:'-30 0 0'});
+        wl=wing(-.046,.03,'.3 .8 1.6'); wr=wing(.046,.03,'.3 .8 1.6'); break;
+      case 'tower': // tall oval, feather plume, short wings
+        body(.04,'1 1.5 1'); body(.028,'1 1.2 .7',d.belly,'0 -.012 .024');
+        eye(-.017,.032,.034,.017,.009); eye(.017,.032,.034,.017,.009);
+        beak(.03,.012,d.accent,'0 .016 .042');
+        for(let i=0;i<4;i++) mk('a-sphere',{radius:.014-i*.002,color:i%2?d.accent:d.color,position:`0 ${.075+i*.02} ${-i*.006}`});
+        wl=wing(-.043,.022,'.35 1.2 1'); wr=wing(.043,.022,'.35 1.2 1'); break;
+      case 'brick': // wide and squat, sleepy eyes, thick beak, block mohawk
+        body(.05,'1.3 .8 1.05'); body(.034,'1.4 .6 .8',d.belly,'0 -.02 .03');
+        eye(-.028,.012,.046,.02,.009); eye(.028,.012,.046,.02,.009);
+        mk('a-box',{width:.05,height:.011,depth:.01,color:d.color,position:'-.028 .026 .052'});
+        mk('a-box',{width:.05,height:.011,depth:.01,color:d.color,position:'.028 .026 .052'});
+        mk('a-box',{width:.04,height:.022,depth:.03,color:d.accent,position:'0 -.006 .06'});
+        for(let i=-1;i<=1;i++) mk('a-box',{width:.014,height:.03+(i?0:.014),depth:.02,color:d.accent,position:`0 ${.04+(i?0:.007)} ${i*.022}`});
+        wl=wing(-.067,.03,'.35 .8 1.1'); wr=wing(.067,.03,'.35 .8 1.1'); break;
+      case 'owl': // round, huge ring eyes, ear tufts, tiny hook beak
+        body(.048,'1 1.05 .95'); body(.032,'1 1 .8',d.belly,'0 -.016 .026');
+        for(const x of [-.021,.021]){ mk('a-ring',{'radius-inner':.012,'radius-outer':.026,color:d.accent,position:`${x} .018 .047`}); eye(x,.018,.04,.017,.011); }
+        beak(.02,.01,'#ffd166','0 -.004 .05','90 0 0');
+        mk('a-cone',{'radius-bottom':.014,'radius-top':0,height:.04,color:d.color,position:'-.03 .056 0',rotation:'0 0 12'});
+        mk('a-cone',{'radius-bottom':.014,'radius-top':0,height:.04,color:d.color,position:'.03 .056 0',rotation:'0 0 -12'});
+        wl=wing(-.05,.026,'.4 1 1'); wr=wing(.05,.026,'.4 1 1'); break;
+      case 'long': // slim, long curved tail of beads, long beak, side feather
+        body(.034,'1 1 1.3'); body(.022,'1 .6 1.1',d.belly,'0 -.016 .01');
+        eye(-.018,.012,.036,.016,.008); eye(.018,.012,.036,.016,.008);
+        beak(.07,.01,d.accent,'0 -.002 .09');
+        for(let i=0;i<5;i++) mk('a-sphere',{radius:.016-i*.002,color:i%2?d.accent:d.color,position:`0 ${.004+i*.008} ${-.05-i*.026}`});
+        mk('a-cone',{'radius-bottom':.01,'radius-top':0,height:.05,color:d.accent,position:'0 .045 .01',rotation:'-20 0 0'});
+        wl=wing(-.04,.028,'.3 .9 1.5'); wr=wing(.04,.028,'.3 .9 1.5'); break;
+    }
+    this.wL=wl; this.wR=wr;
+  },
+  tick(t){ const f=Math.sin(t/70+this.el.object3D.id)*25; this.wL.object3D.rotation.z=f*Math.PI/180; this.wR.object3D.rotation.z=-f*Math.PI/180; }
+});
+
+/* ---------- game logic ---------- */
+AFRAME.registerComponent('game-logic',{
+  init(){
+    const scene=this.el, flock=document.getElementById('flock'), nodes=document.getElementById('nodes');
+    this.critters=[]; this.score=0; this.trail=[];
+    this.W=.62; // half-width of flight area in poster units
+
+    CRITTERS.forEach((c,i)=>{
+      const e=document.createElement('a-entity');
+      e.setAttribute('critter',{kind:c.kind,color:c.color,belly:c.belly,accent:c.accent});
+      e.object3D.scale.setScalar(c.scale);
+      flock.appendChild(e);
+      const s={e,i,mode:'fly',dir:(i%2?1:-1),speed:.05+Math.random()*.05,baseY:-.2+Math.random()*.4,
+               z:.06+Math.random()*.2,phase:Math.random()*6,vx:0,vy:0,vz:0};
+      s.e.object3D.position.set((Math.random()-.5)*1.2,s.baseY,s.z);
+      e.addEventListener('click',()=>this.launch(s));
+      this.critters.push(s);
+    });
+
+    NODES.forEach(n=>{
+      const e=document.createElement('a-sphere');
+      e.setAttribute('radius',.018); e.setAttribute('color','#ffcf33'); e.setAttribute('class','tap');
+      e.setAttribute('position',`${n.x} ${n.y} .02`);
+      e.setAttribute('animation','property: scale; dir: alternate; dur: 700; loop: true; to: 1.4 1.4 1.4; easing: easeInOutSine');
+      e.addEventListener('click',()=>{ const i=document.getElementById('info'); i.textContent=n.text; i.style.display='block'; sfx.node(); clearTimeout(this.it); this.it=setTimeout(()=>i.style.display='none',3500); });
+      nodes.appendChild(e);
+    });
+
+    const hint=document.getElementById('hint');
+    this.target=document.getElementById('target'); this.stage=document.getElementById('stage'); this.seen=false;
+    this.target.addEventListener('targetFound',()=>{hint.style.display='none'; this.seen=true; this.stage.object3D.visible=true;});
+    // targetLost: do nothing on purpose - the stage keeps its last pose
+
+    // start button: unlocks audio (needs a user gesture) and starts AR
+    document.getElementById('go').onclick=async()=>{
+      actx=new (window.AudioContext||window.webkitAudioContext)();
+      document.getElementById('start').style.display='none';
+      const sys=scene.systems['mindar-image-system']; sys.start();
+    };
+  },
+  launch(s){
+    if(s.mode==='launched') return;
+    s.mode='launched'; sfx.launch();
+    this.score++; document.getElementById('score').textContent='Launched: '+this.score;
+    const a=(Math.random()*.9+.2)*(Math.random()<.5?-1:1);
+    s.vx=Math.sin(a)*.9; s.vy=.35+Math.random()*.5; s.vz=.9+Math.random()*.6; s.life=0;
+    // keep flying: it respawns on the other side after leaving
+  },
+  tick(t,dt){
+    dt=Math.min(dt,50)/1000;
+    // follow the poster while it is tracked; freeze at the last pose when it is lost
+    const to=this.target.object3D;
+    if(to.visible){ to.updateWorldMatrix(true,false); to.matrixWorld.decompose(this.stage.object3D.position,this.stage.object3D.quaternion,this.stage.object3D.scale); }
+    for(const s of this.critters){
+      const p=s.e.object3D.position;
+      if(s.mode==='fly'){
+        p.x+=s.dir*s.speed*dt; p.y=s.baseY+Math.sin(t/600+s.phase)*.04;
+        s.e.object3D.rotation.y=s.dir>0?Math.PI/2.6:-Math.PI/2.6;
+        if(p.x>this.W) s.dir=-1; if(p.x<-this.W) s.dir=1;
+      } else {
+        s.life+=dt; p.x+=s.vx*dt; p.y+=s.vy*dt; p.z+=s.vz*dt;
+        s.e.object3D.rotation.z+=dt*9;
+        if(Math.random()<.5) this.puff(p);
+        if(s.life>2.2){ // respawn
+          s.mode='fly'; s.e.object3D.rotation.z=0; s.dir=Math.random()<.5?-1:1;
+          p.set(-s.dir*this.W,s.baseY,s.z);
+        }
+      }
+    }
+    for(let i=this.trail.length-1;i>=0;i--){
+      const q=this.trail[i]; q.life-=dt; const k=Math.max(q.life/.5,0);
+      q.e.object3D.scale.setScalar(k);
+      if(q.life<=0){q.e.parentNode.removeChild(q.e);this.trail.splice(i,1);}
+    }
+  },
+  puff(p){
+    if(this.trail.length>80) return;
+    const e=document.createElement('a-sphere');
+    e.setAttribute('radius',.012); e.setAttribute('color','#ffffff'); e.setAttribute('opacity',.8);
+    e.setAttribute('position',`${p.x} ${p.y} ${p.z}`);
+    document.getElementById('flock').appendChild(e);
+    this.trail.push({e,life:.5});
+  }
+});
+</script>
+</body>
+</html>
